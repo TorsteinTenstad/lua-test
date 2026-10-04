@@ -8,15 +8,61 @@
 #include <string_view>
 #include <vector>
 
+class LuaTable {
+public:
+  LuaTable() = default;
+  LuaTable(lua_State *l, int stackIndex) : l_{l}, stackIndex_{stackIndex} {}
+  template <typename T> T get(const char *key) {
+    luaL_checktype(l_, stackIndex_, LUA_TTABLE);
+    const int type = lua_getfield(l_, stackIndex_, key);
+    if (type == LUA_TNIL) {
+      luaL_argerror(l_, stackIndex_, "table is missing field");
+      assert(false);
+      return {};
+    }
+    T value;
+    const auto topOfStack = lua_gettop(l_);
+    get_from_lua(l_, topOfStack, value);
+    lua_pop(l_, 1);
+    return value;
+  }
+  template <typename T> std::optional<T> get_optional(const char *key) {
+    if (!lua_istable(l_, stackIndex_)) {
+      return std::nullopt;
+    }
+    const int type = lua_getfield(l_, stackIndex_, key);
+    if (type == LUA_TNIL) {
+      return std::nullopt;
+    }
+    T value;
+    const auto topOfStack = lua_gettop(l_);
+    get_from_lua(l_, topOfStack, value);
+    lua_pop(l_, 1);
+    return value;
+  }
+
+private:
+  lua_State *l_{};
+  int stackIndex_{};
+};
+
 void get_from_lua(lua_State *l, int index, double &value) {
   value = luaL_checknumber(l, index);
 }
 void get_from_lua(lua_State *l, int index, int &value) {
   value = luaL_checkinteger(l, index);
 }
+void get_from_lua(lua_State *l, int index, bool &value) {
+  luaL_checktype(l, index, LUA_TBOOLEAN);
+  value = lua_toboolean(l, index);
+}
 void get_from_lua(lua_State *l, int index, std::string_view &value) {
   const char *c = luaL_checkstring(l, index);
   value = std::string_view(c);
+}
+
+void get_from_lua(lua_State *l, int index, LuaTable &value) {
+  value = LuaTable(l, index);
 }
 
 template <typename T>
@@ -42,6 +88,7 @@ void get_from_lua(lua_State *l, int index, std::optional<T> &value) {
   get_from_lua(l, index, t);
   value = t;
 }
+
 int push_to_lua(lua_State *l, double value) {
   lua_pushnumber(l, value);
   return 1;
@@ -70,7 +117,7 @@ template <auto F> int lua_f(lua_State *l) {
   {
     function_args_tuple_t<decltype(F)> args{};
     get_tuple_from_lua(l, args);
-    const auto result = std::apply(F, args);
+    const auto result = std::apply(F, std::move(args));
     if (result.has_value()) {
       if constexpr (std::is_void_v<decltype(result.value())>) {
         return 0;
@@ -101,8 +148,11 @@ std::expected<double, ExecutionStatus> sum(std::vector<double> range) {
   return std::accumulate(range.begin(), range.end(), 0);
 }
 
-std::expected<void, ExecutionStatus> greet(std::string_view name) {
-  std::println("Greetings, {}!", name);
+std::expected<void, ExecutionStatus> greet(std::string_view name,
+                                           LuaTable table) {
+  const auto surname =
+      table.get_optional<std::string_view>("surname").value_or("");
+  std::println("Greetings, {} {}!", name, surname);
   return {};
 }
 
@@ -133,7 +183,8 @@ int main() {
         local range_sum = Sum({1, 2, 3, 4})
         print("Sum({1, 2, 3, 4}) =", range_sum)
         
-        Greet("world")
+        Greet("world", {surname = "of joi"})
+        Greet("world", {})
         
         print("waiting until tick 8...")
         WaitTick(8)
