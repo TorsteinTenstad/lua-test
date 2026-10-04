@@ -1,21 +1,46 @@
-#include <lua.hpp>
-
+#include <cassert>
 #include <cstdio>
 #include <expected>
+#include <lua.hpp>
+#include <numeric>
+#include <optional>
 #include <print>
-#include <string>
-#include <type_traits>
-#include <variant>
+#include <string_view>
+#include <vector>
 
-void pop_from_lua(lua_State *l, int index, double &value) {
+void get_from_lua(lua_State *l, int index, double &value) {
   value = luaL_checknumber(l, index);
 }
-void pop_from_lua(lua_State *l, int index, int &value) {
+void get_from_lua(lua_State *l, int index, int &value) {
   value = luaL_checkinteger(l, index);
 }
-void pop_from_lua(lua_State *l, int index, std::string &value) {
-  const char *cString = luaL_checkstring(l, index);
-  value = std::string(cString);
+void get_from_lua(lua_State *l, int index, std::string_view &value) {
+  const char *c = luaL_checkstring(l, index);
+  value = std::string_view(c);
+}
+
+template <typename T>
+void get_from_lua(lua_State *l, int index, std::vector<T> &value) {
+  luaL_checktype(l, index, LUA_TTABLE);
+  const lua_Unsigned size = lua_rawlen(l, index);
+  value = std::vector<T>(size);
+  for (lua_Unsigned tableIndex = 0; tableIndex < size; ++tableIndex) {
+    lua_geti(l, index, tableIndex + 1);
+    const auto topOfStack = lua_gettop(l);
+    get_from_lua(l, topOfStack, value[tableIndex]);
+    lua_pop(l, 1);
+  }
+}
+
+template <typename T>
+void get_from_lua(lua_State *l, int index, std::optional<T> &value) {
+  if (lua_isnoneornil(l, index)) {
+    value = std::nullopt;
+    return;
+  }
+  T t;
+  get_from_lua(l, index, t);
+  value = t;
 }
 int push_to_lua(lua_State *l, double value) {
   lua_pushnumber(l, value);
@@ -23,118 +48,98 @@ int push_to_lua(lua_State *l, double value) {
 }
 
 template <class... Ts>
-void pop_tuple_from_lua(lua_State *l, std::tuple<Ts &...> t) {
+void get_tuple_from_lua(lua_State *l, std::tuple<Ts...> &t) {
 
   int index = 1;
-  std::apply([&](auto &...out) { (pop_from_lua(l, index++, out), ...); }, t);
+  std::apply([&](auto &...out) { (get_from_lua(l, index++, out), ...); }, t);
 }
 
 enum class ExecutionStatus {};
+using ExecuteResult = std::expected<int, ExecutionStatus>;
 int ticks = 0;
 
-struct Add {
-  static constexpr auto name{"Add"};
-  double a;
-  double b;
-
-  std::expected<double, ExecutionStatus> execute() { return a + b; }
-  auto tuple() { return std::tie(a, b); }
+template <typename F> struct function_args_tuple;
+template <typename F, typename... Args>
+struct function_args_tuple<F (*)(Args...)> {
+  using type = std::tuple<Args...>;
 };
+template <typename F>
+using function_args_tuple_t = typename function_args_tuple<F>::type;
 
-struct Greet {
-  static constexpr auto name{"Greet"};
-  std::string person;
-
-  std::expected<void, ExecutionStatus> execute() {
-    std::println("Greetings, {}!", person);
-    return {};
-  }
-  auto tuple() { return std::tie(person); }
-};
-
-struct WaitTick {
-  static constexpr auto name{"WaitTick"};
-  int tick{};
-
-  std::expected<void, ExecutionStatus> execute() {
-    if (ticks < tick) {
-      return std::unexpected<ExecutionStatus>({});
+template <auto F> int lua_f(lua_State *l) {
+  {
+    function_args_tuple_t<decltype(F)> args{};
+    get_tuple_from_lua(l, args);
+    const auto result = std::apply(F, args);
+    if (result.has_value()) {
+      if constexpr (std::is_void_v<decltype(result.value())>) {
+        return 0;
+      } else {
+        return push_to_lua(l, result.value());
+      }
     }
-    return {};
   }
-  auto tuple() { return std::tie(tick); }
-};
-
-using ScriptFunction = std::variant<Add, Greet, WaitTick>;
-
-ScriptFunction currentFunction;
-
-using ExecuteResult = std::expected<int, ExecutionStatus>;
-
-static ExecuteResult execute(lua_State *l, ScriptFunction scriptFunction) {
-  return std::visit(
-      [=](auto &&f) -> ExecuteResult {
-        std::println("Calling {} with args {}",
-                     std::remove_cvref_t<decltype(f)>::name, f.tuple());
-        const auto returnValue = f.execute();
-        if (returnValue.has_value()) {
-          if constexpr (std::is_void_v<decltype(returnValue.value())>) {
-            return 0;
-          } else {
-            return push_to_lua(l, returnValue.value());
-          }
-        }
-        return std::unexpected(returnValue.error());
-      },
-      scriptFunction);
+  lua_yieldk(l, 0, 0, [](lua_State *l, auto, auto) { return lua_f<F>(l); });
+  assert(false);
+  return 0;
 }
 
-static int resume(lua_State *L, int, lua_KContext) {
-  ExecuteResult result = execute(L, currentFunction);
-  if (!result.has_value()) {
-    return lua_yieldk(L, 0, 0, resume);
+template <auto F>
+static void push_function_to_lua(const char *name, lua_State *l) {
+  lua_pushcfunction(l, lua_f<F>);
+  lua_setglobal(l, name);
+}
+
+namespace lua_api {
+
+std::expected<double, ExecutionStatus> add(double a, double b,
+                                           std::optional<double> c) {
+  return a + b + c.value_or(0);
+}
+
+std::expected<double, ExecutionStatus> sum(std::vector<double> range) {
+  return std::accumulate(range.begin(), range.end(), 0);
+}
+
+std::expected<void, ExecutionStatus> greet(std::string_view name) {
+  std::println("Greetings, {}!", name);
+  return {};
+}
+
+std::expected<void, ExecutionStatus> waitTick(int tick) {
+  if (ticks < tick) {
+    return std::unexpected<ExecutionStatus>({});
   }
-  return result.value();
+  return {};
 }
 
-static int try_execute(lua_State *L, ScriptFunction scriptFunction) {
-  currentFunction = scriptFunction;
-  return resume(L, 0, 0);
-}
-
-template <typename F> static int function_available_to_lua(lua_State *l) {
-  F f;
-  pop_tuple_from_lua(l, f.tuple());
-  return try_execute(l, f);
-}
-template <typename F> static void push_function_to_lua(lua_State *l) {
-  lua_pushcfunction(l, function_available_to_lua<F>);
-  lua_setglobal(l, F::name);
-}
-
-template <class... Ts, class F>
-void invoke_for_each_type(std::type_identity<std::variant<Ts...>>, F &&f) {
-  (f.template operator()<Ts>(), ...);
-}
+} // namespace lua_api
 
 int main() {
   lua_State *L = luaL_newstate();
   luaL_openlibs(L);
 
-  invoke_for_each_type(std::type_identity<ScriptFunction>{},
-                       [&]<class T>() { push_function_to_lua<T>(L); });
+  push_function_to_lua<lua_api::add>("Add", L);
+  push_function_to_lua<lua_api::sum>("Sum", L);
+  push_function_to_lua<lua_api::greet>("Greet", L);
+  push_function_to_lua<lua_api::waitTick>("WaitTick", L);
 
-  // Script runs as a coroutine so cpp_wait_tick can yield.
   const char *script = R"(
         print("Calling into C++ from Lua...")
 
         local sum = Add(3, 4)
         print("Add(3, 4) =", sum)
 
+        local range_sum = Sum({1, 2, 3, 4})
+        print("Sum({1, 2, 3, 4}) =", range_sum)
+        
         Greet("world")
-
+        
         print("waiting until tick 8...")
         WaitTick(8)
+
+        local sum2 = Add(65, 45, -10)
+        print("Add(65, 45, -10) =", sum2)
     )";
 
   lua_State *co = lua_newthread(L);
@@ -146,13 +151,9 @@ int main() {
   }
 
   int nresults = 0;
-  int status = lua_resume(co, nullptr, 0, &nresults);
-
-  // Host loop: each yield returns control here. Advance the tick and
-  // resume; the C continuation retries until ticks reaches the target.
+  int status = LUA_YIELD;
   while (status == LUA_YIELD) {
     ticks++;
-    printf("host: coroutine yielded, now at tick %d\n", ticks);
     status = lua_resume(co, nullptr, 0, &nresults);
   }
 
